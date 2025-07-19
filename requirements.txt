@@ -1,0 +1,8 @@
+streamlit
+requests
+aiohttp
+jinja2
+ddgs
+Pillow
+beautifulsoup4
+playwright

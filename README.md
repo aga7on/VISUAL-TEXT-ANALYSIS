@@ -112,17 +112,7 @@ install.bat
 ├── settings.json                       # Настройки приложения
 ├── install.bat                         # Скрипт установки зависимостей
 ├── run.bat                            # Скрипт запуска приложения
-├── update_for_stable_internet.bat     # Обновление для стабильной работы
-├── install_pinterest_support.bat      # Установка поддержки Pinterest
 ├── requirements.txt                   # Зависимости (обновлено)
-├── templates/
-│   └── report.html                    # Шаблон HTML-отчета
-├── images/                            # Временные изображения
-└── docs/                              # Документация
-    ├── РЕШЕНИЕ_ПРОБЛЕМ_ИНТЕРНЕТА.md
-    ├── ОБНОВЛЕНИЕ_ПОИСКОВИКОВ.md
-    ├── PINTEREST_ИСПРАВЛЕН.md
-    └── ВСЕ_ГОТОВО.md
 ```
 
 ## 🎯 Рекомендации

@@ -17,10 +17,18 @@ from typing import List, Dict, Optional
 
 # Импорт функций для работы с изображениями
 try:
-    from image_utils import search_images, download_images_async, extract_urls_from_text, search_images_from_urls
+    import image_utils
+    from image_utils import (download_images_async, extract_urls_from_text, 
+                           search_images_from_urls)
+    # Импортируем search_images отдельно для проверки
+    search_images = image_utils.search_images
 except ImportError as e:
     st.error(f"Ошибка импорта image_utils: {e}")
     st.error("Проверьте, что все зависимости установлены: pip install -r requirements.txt")
+    st.stop()
+except AttributeError as e:
+    st.error(f"Ошибка атрибута в image_utils: {e}")
+    st.error("Проверьте целостность файла image_utils.py")
     st.stop()
 
 # === НАСТРОЙКИ ===
@@ -41,6 +49,7 @@ os.makedirs(TEMPLATE_DIR, exist_ok=True)
 DEFAULT_SETTINGS = {
     "llm_url": "http://localhost:1234/v1/chat/completions",
     "llm_model": "local-llm",
+    "llm_api_key": "",
     "image_count": 4,
     "search_engine": "duckduckgo",
     "search_language": "auto",
@@ -49,9 +58,11 @@ DEFAULT_SETTINGS = {
     "split_long_paragraphs": False,
     "smart_queries": True,
     "searxng_url": "http://localhost:8080",
+    "searxng_count": 6,
     "duckduckgo_count": 3,
     "pixabay_count": 3,
-    "pinterest_count": 3
+    "pinterest_count": 3,
+    "tenor_count": 3
 }
 
 DEFAULT_PROMPTS = {
@@ -144,20 +155,337 @@ def save_to_history(text: str, paragraphs_count: int, images_count: int, search_
         st.error(f"Ошибка сохранения в историю: {e}")
 
 # === ФУНКЦИИ РАБОТЫ С LLM ===
-def ask_llm(prompt: str, system: str, llm_url: str, model: str) -> str:
+def get_available_models(llm_url: str, api_key: str = None) -> List[str]:
+    """Получение списка доступных моделей через API"""
+    try:
+        # Специальная обработка для Gemini API
+        if ('generativelanguage.googleapis.com' in llm_url or 
+            'googleapis.com' in llm_url or 
+            'gemini' in llm_url.lower()):
+            return get_gemini_models(api_key)
+        
+        # Проверяем и исправляем URL
+        if not llm_url.endswith('/v1/models'):
+            base_url = llm_url.replace('/v1/chat/completions', '').rstrip('/')
+            models_url = f"{base_url}/v1/models"
+        else:
+            models_url = llm_url
+        
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        
+        print(f"🔍 Проверяем доступные модели: {models_url}")
+        
+        response = requests.get(models_url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            models = []
+            
+            # Обрабатываем разные форматы ответов API
+            if 'data' in data and isinstance(data['data'], list):
+                # OpenAI-совместимый формат
+                for model in data['data']:
+                    if isinstance(model, dict) and 'id' in model:
+                        models.append(model['id'])
+                    elif isinstance(model, str):
+                        models.append(model)
+            elif 'models' in data:
+                # Альтернативный формат
+                models = data['models']
+            elif isinstance(data, list):
+                # Простой список
+                models = data
+            
+            # Фильтруем и сортируем модели
+            filtered_models = []
+            for model in models:
+                if isinstance(model, str) and model.strip():
+                    filtered_models.append(model.strip())
+            
+            filtered_models.sort()
+            print(f"✅ Найдено {len(filtered_models)} моделей")
+            return filtered_models
+            
+        else:
+            print(f"❌ Ошибка API: {response.status_code}")
+            return []
+            
+    except requests.exceptions.Timeout:
+        print("⏰ Таймаут при получении моделей")
+        return []
+    except requests.exceptions.ConnectionError:
+        print("🔌 Ошибка соединения с API")
+        return []
+    except Exception as e:
+        print(f"❌ Ошибка получения моделей: {e}")
+        return []
+
+def get_gemini_models(api_key: str = None) -> List[str]:
+    """Получение списка моделей Gemini API"""
+    try:
+        if not api_key:
+            print("❌ API ключ обязателен для Gemini API")
+            return []
+        
+        # URL для получения списка моделей Gemini
+        models_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        
+        print(f"🔍 Проверяем модели Gemini API...")
+        
+        response = requests.get(models_url, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            models = []
+            
+            # Обрабатываем ответ Gemini API
+            if 'models' in data:
+                for model in data['models']:
+                    if isinstance(model, dict) and 'name' in model:
+                        # Извлекаем имя модели из полного пути
+                        model_name = model['name']
+                        if model_name.startswith('models/'):
+                            model_name = model_name.replace('models/', '')
+                        
+                        # Фильтруем только модели для генерации текста
+                        supported_methods = model.get('supportedGenerationMethods', [])
+                        if 'generateContent' in supported_methods:
+                            models.append(model_name)
+            
+            models.sort()
+            print(f"✅ Найдено {len(models)} моделей Gemini")
+            return models
+            
+        elif response.status_code == 400:
+            print("❌ Неверный API ключ для Gemini")
+            return []
+        elif response.status_code == 403:
+            print("❌ Доступ запрещен - проверьте API ключ Gemini")
+            return []
+        else:
+            print(f"❌ Ошибка Gemini API: {response.status_code}")
+            return []
+            
+    except requests.exceptions.Timeout:
+        print("⏰ Таймаут при получении моделей Gemini")
+        return []
+    except requests.exceptions.ConnectionError:
+        print("🔌 Ошибка соединения с Gemini API")
+        return []
+    except Exception as e:
+        print(f"❌ Ошибка получения моделей Gemini: {e}")
+        return []
+
+def ask_gemini(prompt: str, system: str, model: str, api_key: str = None) -> str:
+    """Запрос к Gemini API"""
+    try:
+        if not api_key:
+            print("❌ API ключ обязателен для Gemini API")
+            return ""
+        
+        # URL для генерации контента Gemini
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        
+        # Формируем запрос в формате Gemini API
+        # Объединяем системный промпт и пользовательский запрос
+        # Делаем промпт более безопасным для фильтров Gemini
+        safe_prompt = f"""Задача: {system}
+
+Текст для обработки: {prompt}
+
+Пожалуйста, выполни задачу и предоставь результат в виде списка ключевых слов, каждое на новой строке:"""
+        
+        data = {
+            "contents": [{
+                "parts": [{
+                    "text": safe_prompt
+                }]
+            }],
+            "generationConfig": {
+                "temperature": 0.7,
+                "maxOutputTokens": 200,
+                "topP": 0.8,
+                "topK": 10
+            }
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+        
+        response = requests.post(url, json=data, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            result = response.json()
+            
+            # Отладочная информация
+            print(f"🔍 Структура ответа Gemini: {list(result.keys())}")
+            if 'usageMetadata' in result:
+                usage = result['usageMetadata']
+                print(f"📊 Использование токенов: {usage}")
+            
+            # Извлекаем ответ из структуры Gemini
+            if 'candidates' in result and len(result['candidates']) > 0:
+                candidate = result['candidates'][0]
+                print(f"🔍 Структура candidate: {list(candidate.keys())}")
+                
+                # Проверяем причину блокировки
+                if 'finishReason' in candidate:
+                    finish_reason = candidate['finishReason']
+                    if finish_reason == 'SAFETY':
+                        print("⚠️ Ответ заблокирован фильтрами безопасности Gemini")
+                        return ""
+                    elif finish_reason == 'RECITATION':
+                        print("⚠️ Ответ заблокирован из-за возможного плагиата")
+                        return ""
+                    elif finish_reason == 'MAX_TOKENS':
+                        print("⚠️ Достигнут лимит токенов - ответ может быть обрезан")
+                        # Продолжаем обработку, так как частичный ответ может быть полезен
+                    elif finish_reason not in ['STOP']:
+                        print(f"⚠️ Неожиданная причина завершения: {finish_reason}")
+                
+                if 'content' in candidate:
+                    content = candidate['content']
+                    print(f"🔍 Структура content: {list(content.keys()) if isinstance(content, dict) else type(content)}")
+                    
+                    # Стандартная структура с parts
+                    if isinstance(content, dict) and 'parts' in content and isinstance(content['parts'], list):
+                        parts = content['parts']
+                        if len(parts) > 0 and isinstance(parts[0], dict) and 'text' in parts[0]:
+                            response_text = parts[0]['text'].strip()
+                            print(f"✅ Получен ответ Gemini (parts): {response_text[:100]}...")
+                            return response_text
+                    
+                    # Прямой текст в content
+                    elif isinstance(content, dict) and 'text' in content:
+                        response_text = content['text'].strip()
+                        print(f"✅ Получен ответ Gemini (content.text): {response_text[:100]}...")
+                        return response_text
+                    
+                    # Content как строка
+                    elif isinstance(content, str) and content.strip():
+                        print(f"✅ Получен ответ Gemini (строка): {content[:100]}...")
+                        return content.strip()
+                    
+                    # Новая структура Gemini 2.5 - проверяем все поля рекурсивно
+                    elif isinstance(content, dict):
+                        print(f"🔍 Полная структура content: {content}")
+                        
+                        def extract_text_recursive(obj, path=""):
+                            """Рекурсивно ищем текст в структуре"""
+                            if isinstance(obj, str) and len(obj.strip()) > 10:
+                                return obj.strip()
+                            elif isinstance(obj, dict):
+                                for key, value in obj.items():
+                                    if key == 'text' and isinstance(value, str) and value.strip():
+                                        return value.strip()
+                                    result = extract_text_recursive(value, f"{path}.{key}")
+                                    if result:
+                                        return result
+                            elif isinstance(obj, list):
+                                for i, item in enumerate(obj):
+                                    result = extract_text_recursive(item, f"{path}[{i}]")
+                                    if result:
+                                        return result
+                            return None
+                        
+                        extracted_text = extract_text_recursive(content)
+                        if extracted_text:
+                            print(f"✅ Найден текст в структуре: {extracted_text[:100]}...")
+                            return extracted_text
+                else:
+                    print("⚠️ Candidate не содержит content - возможно заблокирован")
+            else:
+                print("⚠️ Нет candidates в ответе - возможно все ответы заблокированы")
+            
+            # Проверяем альтернативные структуры в корне ответа
+            if 'text' in result:
+                response_text = result['text'].strip()
+                print(f"✅ Получен ответ Gemini (прямой text): {response_text[:100]}...")
+                return response_text
+            
+            # Последняя попытка - ищем любой текст в структуре
+            def find_any_text(obj, path="root"):
+                """Ищем любой осмысленный текст в структуре ответа"""
+                if isinstance(obj, str) and len(obj.strip()) > 10:
+                    # Проверяем, что это не служебная информация
+                    if not any(keyword in obj.lower() for keyword in ['model', 'version', 'id', 'metadata', 'usage']):
+                        return obj.strip()
+                elif isinstance(obj, dict):
+                    for key, value in obj.items():
+                        if key in ['text', 'content', 'message', 'response']:
+                            result = find_any_text(value, f"{path}.{key}")
+                            if result:
+                                return result
+                    # Если не нашли в приоритетных полях, ищем везде
+                    for key, value in obj.items():
+                        if key not in ['usageMetadata', 'modelVersion', 'responseId', 'finishReason', 'index']:
+                            result = find_any_text(value, f"{path}.{key}")
+                            if result:
+                                return result
+                elif isinstance(obj, list):
+                    for i, item in enumerate(obj):
+                        result = find_any_text(item, f"{path}[{i}]")
+                        if result:
+                            return result
+                return None
+            
+            fallback_text = find_any_text(result)
+            if fallback_text:
+                print(f"✅ Найден текст в структуре ответа: {fallback_text[:100]}...")
+                return fallback_text
+            
+            print(f"❌ Не удалось извлечь текст из ответа Gemini")
+            print(f"🔍 Полная структура для отладки: {result}")
+            return ""
+            
+        elif response.status_code == 400:
+            print("❌ Неверный запрос к Gemini API")
+            return ""
+        elif response.status_code == 403:
+            print("❌ Доступ запрещен - проверьте API ключ Gemini")
+            return ""
+        elif response.status_code == 429:
+            print("❌ Превышен лимит запросов Gemini API")
+            return ""
+        else:
+            print(f"❌ Ошибка Gemini API: {response.status_code}")
+            return ""
+        
+    except requests.exceptions.Timeout:
+        print("⏰ Таймаут запроса к Gemini API")
+        return ""
+    except requests.exceptions.ConnectionError:
+        print("🔌 Ошибка соединения с Gemini API")
+        return ""
+    except Exception as e:
+        print(f"❌ Ошибка запроса к Gemini: {e}")
+        return ""
+
+def ask_llm(prompt: str, system: str, llm_url: str, model: str, api_key: str = None) -> str:
     """Запрос к LLM серверу"""
     try:
+        # Специальная обработка для Gemini API
+        if ('generativelanguage.googleapis.com' in llm_url or 
+            'googleapis.com' in llm_url or 
+            'gemini' in llm_url.lower()):
+            return ask_gemini(prompt, system, model, api_key)
+        
         # Проверяем и исправляем URL
         if not llm_url.endswith('/v1/chat/completions'):
             llm_url = llm_url.rstrip('/') + '/v1/chat/completions'
         
         # Проверяем доступность сервера
         base_url = llm_url.replace('/v1/chat/completions', '')
+        headers = {'Content-Type': 'application/json'}
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+        
         try:
-            health_response = requests.get(f"{base_url}/health", timeout=5)
+            health_response = requests.get(f"{base_url}/health", headers=headers, timeout=5)
         except:
             try:
-                health_response = requests.get(f"{base_url}/v1/models", timeout=5)
+                health_response = requests.get(f"{base_url}/v1/models", headers=headers, timeout=5)
             except:
                 pass
         
@@ -172,7 +500,7 @@ def ask_llm(prompt: str, system: str, llm_url: str, model: str) -> str:
             "max_tokens": 200
         }
         
-        response = requests.post(llm_url, json=data, timeout=30)
+        response = requests.post(llm_url, json=data, headers=headers, timeout=30)
         
         if response.status_code == 200:
             result = response.json()
@@ -196,7 +524,8 @@ def generate_smart_queries(paragraph: str, settings: Dict) -> List[str]:
             prompt=user_prompt,
             system=system_prompt,
             llm_url=settings["llm_url"],
-            model=settings["llm_model"]
+            model=settings["llm_model"],
+            api_key=settings.get("llm_api_key")
         )
         
         if not response:
@@ -633,14 +962,61 @@ def main():
         llm_url = st.text_input(
             "URL сервера",
             value=st.session_state.settings["llm_url"],
-            help="Например: http://localhost:1234"
+            help="Например: http://localhost:1234, https://api.openai.com или https://generativelanguage.googleapis.com для Gemini"
         )
         
-        llm_model = st.text_input(
-            "Модель",
-            value=st.session_state.settings["llm_model"],
-            help="Название модели LLM"
+        llm_api_key = st.text_input(
+            "API ключ (опционально)",
+            value=st.session_state.settings.get("llm_api_key", ""),
+            type="password",
+            help="Для внешних API (OpenAI, Anthropic, Google Gemini и др.). Оставьте пустым для локальных серверов"
         )
+        
+        # Модель с автоматическим получением списка
+        col_model, col_refresh = st.columns([4, 1])
+        
+        with col_model:
+            # Инициализируем список доступных моделей в session_state
+            if 'available_models' not in st.session_state:
+                st.session_state.available_models = []
+            
+            # Если есть доступные модели, показываем selectbox, иначе text_input
+            if st.session_state.available_models:
+                current_model = st.session_state.settings.get("llm_model", "local-llm")
+                if current_model not in st.session_state.available_models:
+                    st.session_state.available_models.insert(0, current_model)
+                
+                try:
+                    default_index = st.session_state.available_models.index(current_model)
+                except ValueError:
+                    default_index = 0
+                
+                llm_model = st.selectbox(
+                    "Модель",
+                    options=st.session_state.available_models,
+                    index=default_index,
+                    help="Выберите модель из списка доступных"
+                )
+            else:
+                llm_model = st.text_input(
+                    "Модель",
+                    value=st.session_state.settings.get("llm_model", "local-llm"),
+                    help="Название модели LLM (нажмите 🔄 для автоматического получения списка)"
+                )
+        
+        with col_refresh:
+            st.write("")  # Отступ для выравнивания
+            if st.button("🔄", help="Обновить список доступных моделей"):
+                with st.spinner("Получаем список моделей..."):
+                    models = get_available_models(llm_url, llm_api_key if llm_api_key else None)
+                    
+                    if models:
+                        st.session_state.available_models = models
+                        st.success(f"✅ Найдено {len(models)} моделей!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Не удалось получить список моделей")
+                        st.info("💡 Проверьте URL сервера и API ключ")
         
         # Менеджер промптов
         st.subheader("🧠 Промпты для LLM")
@@ -676,22 +1052,61 @@ def main():
                 edited_prompt = current_prompt
         
         with col2:
+            # Инициализируем состояния для управления промптами
+            if 'show_new_prompt' not in st.session_state:
+                st.session_state.show_new_prompt = False
+            if 'show_delete_confirm' not in st.session_state:
+                st.session_state.show_delete_confirm = False
+            
             # Добавление нового промпта
             if st.button("➕ Новый"):
+                st.session_state.show_new_prompt = not st.session_state.show_new_prompt
+                st.session_state.show_delete_confirm = False
+            
+            if st.session_state.show_new_prompt:
                 new_name = st.text_input("Название промпта:", key="new_prompt_name")
-                if new_name and st.button("Создать", key="create_prompt"):
-                    prompts[new_name] = "Создай короткие поисковые запросы для изображений к тексту."
-                    save_custom_prompts(prompts)
-                    st.success(f"Промпт '{new_name}' создан!")
-                    st.rerun()
+                col_create, col_cancel = st.columns(2)
+                
+                with col_create:
+                    if st.button("✅ Создать", key="create_prompt"):
+                        if new_name and new_name.strip():
+                            prompts[new_name.strip()] = "Создай короткие поисковые запросы для изображений к тексту."
+                            save_custom_prompts(prompts)
+                            st.success(f"Промпт '{new_name}' создан!")
+                            st.session_state.show_new_prompt = False
+                            st.rerun()
+                        else:
+                            st.error("Введите название промпта")
+                
+                with col_cancel:
+                    if st.button("❌ Отмена", key="cancel_new"):
+                        st.session_state.show_new_prompt = False
+                        st.rerun()
             
             # Удаление промпта
-            if len(prompts) > 1 and st.button("🗑️ Удалить"):
-                if st.button(f"Удалить '{selected_prompt}'?", key="confirm_delete"):
-                    del prompts[selected_prompt]
-                    save_custom_prompts(prompts)
-                    st.success(f"Промпт '{selected_prompt}' удален!")
-                    st.rerun()
+            if len(prompts) > 1:
+                if st.button("🗑️ Удалить"):
+                    st.session_state.show_delete_confirm = not st.session_state.show_delete_confirm
+                    st.session_state.show_new_prompt = False
+                
+                if st.session_state.show_delete_confirm:
+                    st.warning(f"Удалить промпт '{selected_prompt}'?")
+                    col_delete, col_cancel_del = st.columns(2)
+                    
+                    with col_delete:
+                        if st.button("✅ Да, удалить", key="confirm_delete"):
+                            del prompts[selected_prompt]
+                            save_custom_prompts(prompts)
+                            st.success(f"Промпт '{selected_prompt}' удален!")
+                            st.session_state.show_delete_confirm = False
+                            st.rerun()
+                    
+                    with col_cancel_del:
+                        if st.button("❌ Отмена", key="cancel_delete"):
+                            st.session_state.show_delete_confirm = False
+                            st.rerun()
+            else:
+                st.info("Нельзя удалить последний промпт")
         
         # Настройки поиска
         st.subheader("🔍 Поиск изображений")
@@ -699,7 +1114,7 @@ def main():
         # Режим выбора поисковиков
         search_mode = st.radio(
             "Режим поиска",
-            options=["Один поисковик", "Множественный выбор", "SearXNG эксклюзивный"],
+            options=["Один поисковик", "Множественный выбор", "🚧 SearXNG эксклюзивный (WIP)"],
             help="Выберите режим поиска изображений"
         )
         
@@ -709,7 +1124,7 @@ def main():
             if isinstance(current_engine, list):
                 current_engine = current_engine[0] if current_engine else "duckduckgo"
             
-            available_engines = ["duckduckgo", "pixabay", "pinterest", "searxng"]
+            available_engines = ["duckduckgo", "pixabay", "pinterest", "searxng", "tenor"]
             try:
                 default_index = available_engines.index(current_engine)
             except ValueError:
@@ -730,18 +1145,78 @@ def main():
             
             search_engines = st.multiselect(
                 "Выберите поисковики",
-                options=["duckduckgo", "pixabay", "pinterest", "searxng"],
+                options=["duckduckgo", "pixabay", "pinterest", "searxng", "tenor"],
                 default=current_engines,
                 help="Результаты будут объединены из всех выбранных поисковиков"
             )
             search_engine = search_engines if search_engines else ["duckduckgo"]
-        else:  # SearXNG эксклюзивный
+        else:  # SearXNG эксклюзивный (WIP)
             search_engine = "searxng"
-            searxng_url = st.text_input(
-                "URL SearXNG сервера",
-                value=st.session_state.settings.get("searxng_url", "http://localhost:8080"),
-                help="URL вашего SearXNG сервера"
-            )
+            
+            # Предупреждение о статусе WIP
+            st.warning("⚠️ **Режим в разработке (WIP)**: Возможны дублирующиеся результаты. Костыль дедупликации готов к применению - см. `MANUAL_DEDUP_INSTRUCTIONS.md`")
+            
+            # Упрощенный интерфейс для SearXNG
+            col_url, col_link = st.columns([3, 1])
+            
+            with col_url:
+                searxng_url = st.text_input(
+                    "URL SearXNG сервера",
+                    value=st.session_state.settings.get("searxng_url", "http://localhost:8080"),
+                    help="URL вашего SearXNG сервера (локальный: http://localhost:8080)"
+                )
+            
+            with col_link:
+                st.write("")  # Отступ для выравнивания
+                if st.button("🌐 Найти инстансы", help="Открыть сайт со списком SearXNG инстансов"):
+                    st.markdown("""
+                    **🔗 Список SearXNG инстансов:**
+                    
+                    Перейдите на [searx.space](https://searx.space/) чтобы найти рабочие инстансы SearXNG.
+                    
+                    **💡 Как выбрать инстанс:**
+                    1. Откройте [searx.space](https://searx.space/)
+                    2. Выберите инстанс с зеленым статусом
+                    3. Скопируйте URL и вставьте в поле выше
+                    
+                    **🚀 Рекомендуемые инстансы:**
+                    - `http://localhost:8080` (локальный - рекомендуется)
+                    - `https://searx.be`
+                    - `https://searx.dresden.network`
+                    - `https://search.sapti.me`
+                    - `https://searx.tiekoetter.com`
+                    """)
+            
+            # Используем общую настройку количества изображений
+            image_count = st.session_state.settings.get("image_count", 4)
+            
+            # Информация о SearXNG
+            with st.expander("ℹ️ Информация о SearXNG"):
+                st.markdown("""
+                **SearXNG** - это метапоисковая система с открытым исходным кодом.
+                
+                **Преимущества:**
+                - 🔒 Приватность - не отслеживает пользователей
+                - 🌐 Агрегирует результаты из множества поисковиков (Bing, Google, Yandex)
+                - 🚀 Быстрый поиск изображений
+                - 🆓 Бесплатное использование
+                
+                **🚧 Текущие проблемы (WIP):**
+                - Дублирующиеся результаты в поиске
+                - Костыль дедупликации готов, но требует ручного применения
+                
+                **🔧 Как исправить:**
+                1. Откройте файл `MANUAL_DEDUP_INSTRUCTIONS.md`
+                2. Следуйте пошаговой инструкции
+                3. Перезапустите приложение
+                
+                **Как найти рабочий инстанс:**
+                1. Перейдите на [searx.space](https://searx.space/)
+                2. Выберите инстанс с хорошим временем отклика
+                3. Проверьте, что он поддерживает поиск изображений
+                
+                **💡 Рекомендация:** Используйте локальный SearXNG (`http://localhost:8080`) для лучшей производительности и приватности.
+                """)
         
         # Убираем ограничение - используем все запросы от LLM
         st.info("💡 Количество запросов определяется автоматически на основе ответа LLM")
@@ -807,6 +1282,7 @@ def main():
         new_settings = {
             "llm_url": llm_url,
             "llm_model": llm_model,
+            "llm_api_key": llm_api_key,
             "search_engine": search_engine,
             "image_count": image_count,
             "smart_queries": smart_queries,

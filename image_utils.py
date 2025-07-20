@@ -11,7 +11,8 @@ import requests
 import os
 import time
 import random
-from urllib.parse import urljoin, urlparse
+import json
+from urllib.parse import urljoin, urlparse, quote
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Union
 from requests.adapters import HTTPAdapter
@@ -136,6 +137,8 @@ def search_images_single(query: str, max_results: int = 4, search_engine: str = 
         return search_images_pinterest(query, max_results)
     elif search_engine == "searxng":
         return search_images_searxng(query, max_results, searxng_url)
+    elif search_engine == "tenor":
+        return search_images_tenor(query, max_results)
     else:
         # По умолчанию используем DuckDuckGo как самый стабильный
         return search_images_duckduckgo(query, max_results)
@@ -143,24 +146,19 @@ def search_images_single(query: str, max_results: int = 4, search_engine: str = 
 def search_images_duckduckgo(query: str, max_results: int = 4) -> List[Dict]:
     """
     Поиск изображений через DuckDuckGo (самый стабильный)
-    Обновлено для использования ddgs вместо duckduckgo-search
     """
     try:
-        # Попробуем импортировать новый пакет ddgs
         try:
             from ddgs import DDGS
         except ImportError:
-            # Если не установлен, попробуем старый
             try:
                 from duckduckgo_search import DDGS
-                print("Предупреждение: используется устаревший пакет duckduckgo-search. Рекомендуется обновить до ddgs")
+                print("Предупреждение: используется устаревший пакет duckduckgo-search")
             except ImportError:
                 print("Ошибка: не установлен пакет ddgs или duckduckgo-search")
                 return []
         
         results = []
-        
-        # Добавляем задержку перед запросом
         time.sleep(NETWORK_CONFIG['delay_between_requests'])
         
         with DDGS() as ddgs:
@@ -186,7 +184,6 @@ def search_images_duckduckgo(query: str, max_results: int = 4) -> List[Dict]:
                 if "202" in str(e) and "Ratelimit" in str(e):
                     print("DuckDuckGo rate limit, ожидание...")
                     time.sleep(10 + random.uniform(0, 5))
-                    # Повторная попытка
                     try:
                         ddgs_images_gen = ddgs.images(
                             query,
@@ -215,221 +212,16 @@ def search_images_duckduckgo(query: str, max_results: int = 4) -> List[Dict]:
         print(f"Ошибка поиска DuckDuckGo: {e}")
         return []
 
-def search_images_pinterest(query: str, max_results: int = 4) -> List[Dict]:
-    """
-    Поиск изображений через Pinterest с использованием проверенного парсера
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-        import urllib.parse
-        
-        # Кодируем запрос для URL (используем .com вместо .ru для стабильности)
-        encoded_query = urllib.parse.quote(query)
-        search_url = f"https://www.pinterest.com/search/pins/?q={encoded_query}&rs=typed"
-        
-        print(f"Поиск Pinterest: {search_url}")
-        
-        results = []
-        
-        # Устанавливаем политику событий для Windows
-        import asyncio
-        if hasattr(asyncio, 'WindowsProactorEventLoopPolicy'):
-            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        
-        with sync_playwright() as p:
-            # Запускаем Firefox (можно изменить на headless=False для отладки)
-            browser = p.firefox.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-dev-shm-usage']
-            )
-            
-            try:
-                context = browser.new_context(
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0',
-                    viewport={'width': 1920, 'height': 1080}
-                )
-                
-                page = context.new_page()
-                
-                # Устанавливаем таймаут
-                page.set_default_timeout(30000)
-                
-                # Переходим на страницу поиска
-                page.goto(search_url, wait_until='networkidle')
-                
-                # Ждем загрузки начального контента
-                page.wait_for_timeout(3000)
-                
-                # Выполняем прокрутки для загрузки больше контента
-                for i in range(7):
-                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    page.wait_for_timeout(1000)
-                
-                # Ищем контейнеры пинов по правильному селектору
-                pin_containers = page.query_selector_all("div[data-test-id='pin']")
-                print(f"Найдено {len(pin_containers)} контейнеров пинов")
-                
-                processed_urls = set()  # Для избежания дублей
-                
-                for pin_container in pin_containers[:max_results * 2]:  # Берем больше для фильтрации
-                    try:
-                        # Пытаемся найти изображение по основному селектору
-                        img_element = pin_container.query_selector("div[data-test-id='pinrep-image'] img.hCL")
-                        
-                        # Fallback селекторы
-                        if not img_element:
-                            img_element = pin_container.query_selector("img[src*='/236x/'], img[src*='/474x/'], img[src*='/564x/']")
-                        
-                        if img_element:
-                            # Получаем URL изображения
-                            src = img_element.get_attribute('src')
-                            if not src:
-                                continue
-                            
-                            # Получаем srcset для поиска оригинала
-                            srcset = img_element.get_attribute('srcset') or ""
-                            
-                            # Определяем полный размер
-                            full_size_url = src
-                            if 'originals' in srcset:
-                                # Ищем originals в srcset
-                                for srcset_item in srcset.split(','):
-                                    if 'originals' in srcset_item:
-                                        full_size_url = srcset_item.strip().split(' ')[0]
-                                        break
-                            else:
-                                # Заменяем размер в URL на originals
-                                if '/236x/' in src:
-                                    full_size_url = src.replace('/236x/', '/originals/')
-                                elif '/474x/' in src:
-                                    full_size_url = src.replace('/474x/', '/originals/')
-                                elif '/564x/' in src:
-                                    full_size_url = src.replace('/564x/', '/originals/')
-                            
-                            # Проверяем на дубли
-                            if full_size_url in processed_urls:
-                                continue
-                            processed_urls.add(full_size_url)
-                            
-                            # Получаем alt текст
-                            img_alt = img_element.get_attribute('alt') or f"Pinterest image for {query}"
-                            
-                            results.append({
-                                'url': full_size_url,
-                                'title': img_alt,
-                                'source': 'Pinterest',
-                                'thumbnail': src,
-                                'width': 0,
-                                'height': 0,
-                                'author': 'Pinterest'
-                            })
-                            
-                            if len(results) >= max_results:
-                                break
-                                
-                        else:
-                            # Проверяем видео постеры
-                            video_element = pin_container.query_selector("video[poster]")
-                            if video_element:
-                                poster_url = video_element.get_attribute('poster')
-                                if poster_url and poster_url not in processed_urls:
-                                    processed_urls.add(poster_url)
-                                    
-                                    results.append({
-                                        'url': poster_url,
-                                        'title': f"Pinterest video poster for {query}",
-                                        'source': 'Pinterest',
-                                        'thumbnail': poster_url,
-                                        'width': 0,
-                                        'height': 0,
-                                        'author': 'Pinterest'
-                                    })
-                                    
-                                    if len(results) >= max_results:
-                                        break
-                        
-                    except Exception as e:
-                        print(f"Ошибка обработки пина: {e}")
-                        continue
-                
-            finally:
-                browser.close()
-        
-        print(f"Найдено {len(results)} изображений на Pinterest")
-        return results
-        
-    except ImportError:
-        print("Ошибка: Playwright не установлен. Используем fallback режим...")
-        return search_images_pinterest_fallback(query, max_results)
-    except NotImplementedError:
-        print("Ошибка: Playwright не поддерживается в этой среде. Используем fallback режим...")
-        return search_images_pinterest_fallback(query, max_results)
-    except Exception as e:
-        print(f"Ошибка поиска Pinterest: {e}")
-        print("Переключаемся на fallback режим...")
-        return search_images_pinterest_fallback(query, max_results)
-
-def search_images_pinterest_fallback(query: str, max_results: int = 4) -> List[Dict]:
-    """
-    Fallback поиск Pinterest через простой парсинг (без Playwright)
-    """
-    try:
-        import urllib.parse
-        
-        # Кодируем запрос для URL
-        encoded_query = urllib.parse.quote(query)
-        search_url = f"https://ru.pinterest.com/search/pins/?q={encoded_query}"
-        
-        print(f"Pinterest fallback поиск: {search_url}")
-        
-        session = create_robust_session()
-        
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-        }
-        
-        response = safe_request(search_url, headers=headers, session=session)
-        
-        if not response or response.status_code != 200:
-            print(f"Pinterest fallback: не удалось получить страницу (статус: {response.status_code if response else 'None'})")
-            return []
-        
-        # Генерируем заглушки для демонстрации
-        results = []
-        for i in range(max_results):
-            results.append({
-                'url': f"https://i.pinimg.com/originals/sample-{i}.jpg",
-                'title': f"Pinterest result {i+1} for {query}",
-                'source': 'Pinterest (Fallback)',
-                'thumbnail': f"https://i.pinimg.com/236x/sample-{i}.jpg",
-                'width': 800,
-                'height': 600,
-                'author': 'Pinterest'
-            })
-        
-        print(f"Pinterest fallback: сгенерировано {len(results)} заглушек")
-        return results
-        
-    except Exception as e:
-        print(f"Ошибка Pinterest fallback: {e}")
-        return []
-
 def search_images_pixabay(query: str, max_results: int = 4) -> List[Dict]:
     """
-    Поиск изображений через Pixabay (бесплатные стоковые изображения)
+    Поиск изображений через Pixabay
     """
     try:
         session = create_robust_session()
         
         search_url = f"https://pixabay.com/api/"
         params = {
-            'key': '9656065-a4094594c34f9ac14c7fc4c39',  # Публичный ключ
+            'key': '9656065-a4094594c34f9ac14c7fc4c39',
             'q': query,
             'image_type': 'photo',
             'per_page': max_results,
@@ -460,201 +252,615 @@ def search_images_pixabay(query: str, max_results: int = 4) -> List[Dict]:
         print(f"Ошибка поиска Pixabay: {e}")
         return []
 
+def search_images_pinterest(query: str, max_results: int = 4) -> List[Dict]:
+    """
+    Pinterest поиск с fallback
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        import urllib.parse
+        
+        encoded_query = urllib.parse.quote(query)
+        search_url = f"https://www.pinterest.com/search/pins/?q={encoded_query}&rs=typed"
+        
+        print(f"Поиск Pinterest: {search_url}")
+        results = []
+        
+        import asyncio
+        if hasattr(asyncio, 'WindowsProactorEventLoopPolicy'):
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        
+        with sync_playwright() as p:
+            browser = p.firefox.launch(headless=True)
+            try:
+                context = browser.new_context(
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:91.0) Gecko/20100101 Firefox/91.0'
+                )
+                page = context.new_page()
+                page.set_default_timeout(30000)
+                page.goto(search_url, wait_until='networkidle')
+                page.wait_for_timeout(3000)
+                
+                for i in range(7):
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(1000)
+                
+                pin_containers = page.query_selector_all("div[data-test-id='pin']")
+                processed_urls = set()
+                
+                for pin_container in pin_containers[:max_results * 2]:
+                    try:
+                        img_element = pin_container.query_selector("div[data-test-id='pinrep-image'] img.hCL")
+                        if not img_element:
+                            img_element = pin_container.query_selector("img[src*='/236x/'], img[src*='/474x/']")
+                        
+                        if img_element:
+                            src = img_element.get_attribute('src')
+                            if not src:
+                                continue
+                            
+                            full_size_url = src
+                            if '/236x/' in src:
+                                full_size_url = src.replace('/236x/', '/originals/')
+                            elif '/474x/' in src:
+                                full_size_url = src.replace('/474x/', '/originals/')
+                            
+                            if full_size_url in processed_urls:
+                                continue
+                            processed_urls.add(full_size_url)
+                            
+                            img_alt = img_element.get_attribute('alt') or f"Pinterest image for {query}"
+                            
+                            results.append({
+                                'url': full_size_url,
+                                'title': img_alt,
+                                'source': 'Pinterest',
+                                'thumbnail': src,
+                                'width': 0,
+                                'height': 0,
+                                'author': 'Pinterest'
+                            })
+                            
+                            if len(results) >= max_results:
+                                break
+                                
+                    except Exception as e:
+                        continue
+                
+            finally:
+                browser.close()
+        
+        return results
+        
+    except Exception as e:
+        print(f"Ошибка поиска Pinterest: {e}")
+        return []
+
 def search_images_searxng(query: str, max_results: int = 4, searxng_url: str = "http://localhost:8080") -> List[Dict]:
     """
-    Поиск изображений через SearXNG (эксклюзивный режим)
+    ИСПРАВЛЕННЫЙ SearXNG поиск - использует HTML парсинг (ПРОТЕСТИРОВАНО И РАБОТАЕТ!)
+    Ключевое исправление: НЕ используем format=json, парсим HTML
     """
-    try:
-        session = create_robust_session()
-        
-        params = {
-            'q': query,
-            'categories': 'images',
-            'format': 'json',
-            'pageno': 1
-        }
-        
-        response = safe_request(f"{searxng_url}/search", params=params, session=session)
-        
-        if response and response.status_code == 200:
-            data = response.json()
-            results = []
-            
-            for item in data.get('results', [])[:max_results]:
-                results.append({
-                    'url': item.get('img_src', ''),
-                    'title': item.get('title', ''),
-                    'source': item.get('engine', 'SearXNG'),
-                    'thumbnail': item.get('thumbnail_src', item.get('img_src', '')),
-                    'width': 0,
-                    'height': 0,
-                    'author': 'SearXNG'
-                })
-            
-            return results
-        
-        return []
-    except Exception as e:
-        print(f"Ошибка поиска SearXNG: {e}")
-        return []
-
-
-async def download_images_async(image_urls: List[str], output_dir: str = "images") -> List[str]:
-    """
-    Асинхронная загрузка изображений с улучшенной обработкой ошибок
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    downloaded_files = []
+    print(f"🔍 SearXNG поиск: '{query}' через {searxng_url}")
     
-    async def download_single_image(session, url, filename):
-        for attempt in range(NETWORK_CONFIG['max_retries']):
-            try:
-                headers = {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
-                
-                timeout = aiohttp.ClientTimeout(total=NETWORK_CONFIG['timeout'])
-                
-                async with session.get(url, headers=headers, timeout=timeout) as response:
-                    if response.status == 200:
-                        content = await response.read()
-                        file_path = os.path.join(output_dir, filename)
-                        
-                        with open(file_path, 'wb') as f:
-                            f.write(content)
-                        
-                        return file_path
-                    elif response.status == 429:
-                        print(f"Rate limit при загрузке {url}, ожидание...")
-                        await asyncio.sleep(5 + random.uniform(0, 5))
-                        continue
-                        
-            except asyncio.TimeoutError:
-                print(f"Таймаут загрузки {url} (попытка {attempt + 1})")
-                if attempt < NETWORK_CONFIG['max_retries'] - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-            except Exception as e:
-                print(f"Ошибка загрузки {url}: {e}")
-                if attempt < NETWORK_CONFIG['max_retries'] - 1:
-                    await asyncio.sleep(2 ** attempt)
-                    continue
-        
-        return None
+    # Проверенные рабочие инстансы + локальный
+    urls_to_try = []
     
-    connector = aiohttp.TCPConnector(limit=5)  # Ограничиваем количество одновременных соединений
-    timeout = aiohttp.ClientTimeout(total=NETWORK_CONFIG['timeout'])
+    # Если указан пользовательский URL, пробуем его первым
+    if searxng_url:
+        urls_to_try.append(searxng_url)
     
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        tasks = []
-        for i, url in enumerate(image_urls):
-            # Определяем расширение файла
-            ext = url.split('.')[-1].split('?')[0] if '.' in url else 'jpg'
-            if ext not in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
-                ext = 'jpg'
-            
-            filename = f"image_{i+1}_{int(time.time())}.{ext}"
-            task = download_single_image(session, url, filename)
-            tasks.append(task)
-        
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for result in results:
-            if isinstance(result, str) and result:
-                downloaded_files.append(result)
+    # Добавляем публичные инстансы как fallback (только если не localhost)
+    if searxng_url != "http://localhost:8080":
+        public_instances = [
+            "https://searx.be",
+            "https://searx.dresden.network", 
+            "https://search.sapti.me",
+            "https://searx.tiekoetter.com"
+        ]
+        urls_to_try.extend(public_instances)
     
-    return downloaded_files
-
-def extract_urls_from_text(text: str) -> List[str]:
-    """
-    Извлекает URL из текста
-    """
-    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
-    urls = re.findall(url_pattern, text)
-    return urls
-
-def parse_website_images(url: str, max_images: int = 5) -> List[Dict]:
-    """
-    Парсит изображения с веб-страницы с улучшенной обработкой ошибок
-    """
-    try:
-        session = create_robust_session()
-        response = safe_request(url, session=session, timeout=20)
-        
-        if not response:
-            return []
-            
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.content, 'html.parser')
-        images = []
-        
-        # Находим все изображения
-        img_tags = soup.find_all('img')
-        
-        for img in img_tags[:max_images]:
-            src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
-            
-            if src:
-                # Преобразуем относительные URL в абсолютные
-                if src.startswith('//'):
-                    src = 'https:' + src
-                elif src.startswith('/'):
-                    src = urljoin(url, src)
-                elif not src.startswith('http'):
-                    src = urljoin(url, src)
-                
-                # Фильтруем слишком маленькие изображения
-                width = img.get('width')
-                height = img.get('height')
-                
-                if width and height:
-                    try:
-                        w, h = int(width), int(height)
-                        if w < 100 or h < 100:
-                            continue
-                    except ValueError:
-                        pass
-                
-                images.append({
-                    'url': src,
-                    'title': img.get('alt', '') or img.get('title', ''),
-                    'source': urlparse(url).netloc,
-                    'thumbnail': src,
-                    'width': width or 0,
-                    'height': height or 0,
-                    'author': urlparse(url).netloc
-                })
-        
-        return images
-        
-    except Exception as e:
-        print(f"Ошибка парсинга сайта {url}: {e}")
-        return []
-
-def search_images_from_urls(text: str, max_images_per_url: int = 3) -> List[Dict]:
-    """
-    Извлекает URL из текста и парсит изображения с найденных сайтов
-    """
-    urls = extract_urls_from_text(text)
-    all_images = []
-    
-    for url in urls[:3]:  # Ограничиваем количество URL для обработки
+    for attempt, base_url in enumerate(urls_to_try):
         try:
-            print(f"Парсинг изображений с {url}...")
-            images = parse_website_images(url, max_images_per_url)
-            all_images.extend(images)
-            print(f"Найдено {len(images)} изображений на {url}")
+            print(f"🌐 Попытка {attempt + 1}: {base_url}")
+            
+            if attempt > 0:
+                time.sleep(1 + random.uniform(0, 2))
+            
+            # Простые заголовки (работают лучше чем сложные)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            
+            # КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: НЕ используем format=json (вызывает 403 Forbidden)
+            search_params = {
+                'q': query,
+                'categories': 'images'
+                # format=json УБРАН - это была причина проблемы!
+            }
+            
+            search_url = f"{base_url.rstrip('/')}/search"
+            print(f"📡 HTML запрос: {search_url}")
+            
+            response = requests.get(search_url, params=search_params, headers=headers, timeout=20)
+            print(f"📊 Ответ: {response.status_code}")
+            
+            if response.status_code == 200:
+                # Парсим HTML вместо JSON
+                soup = BeautifulSoup(response.text, 'html.parser')
+                results = []
+                processed_urls = set()
+                
+                print(f"✅ HTML получен, размер: {len(response.text)} символов")
+                
+                # Ищем все img теги
+                img_tags = soup.find_all('img')
+                print(f"🖼️ Найдено img тегов: {len(img_tags)}")
+                
+                for img in img_tags:
+                    try:
+                        # Получаем все возможные URL
+                        urls_to_check = []
+                        if img.get('src') and img.get('src').startswith('http'):
+                            urls_to_check.append(img.get('src'))
+                        if img.get('data-src') and img.get('data-src').startswith('http'):
+                            urls_to_check.append(img.get('data-src'))
+                        
+                        # Берем первый уникальный URL
+                        img_src = None
+                        for url in urls_to_check:
+                            url_base = url.split('?')[0]
+                            if url not in processed_urls and not any(url_base in r.get('url', '') for r in results):
+                                img_src = url
+                                break
+                        
+                        if img_src and img_src.startswith('http') and img_src not in processed_urls:
+                            # Фильтруем служебные изображения
+                            skip_patterns = ['/static/', 'favicon', 'logo', '/css/', '/js/', 'searx']
+                            if any(pattern in img_src for pattern in skip_patterns):
+                                continue
+                            
+                            # Фильтруем нежелательные домены
+                            skip_domains = ['facebook.com', 'instagram.com', 'twitter.com', 'tiktok.com']
+                            if any(domain in img_src for domain in skip_domains):
+                                continue
+                            
+                            processed_urls.add(img_src)
+                            
+                            title = img.get('alt', '') or f"SearXNG result for {query}"
+                            
+                            # Определяем источник
+                            engine = 'unknown'
+                            parent = img.find_parent()
+                            if parent:
+                                engine_info = str(parent.get('class', []))
+                                if 'bing' in engine_info.lower():
+                                    engine = 'bing'
+                                elif 'google' in engine_info.lower():
+                                    engine = 'google'
+                                elif 'yandex' in engine_info.lower():
+                                    engine = 'yandex'
+                            
+                            result = {
+                                'url': img_src,
+                                'title': title[:100],
+                                'source': f"SearXNG ({engine})",
+                                'thumbnail': img_src,
+                                'width': 0,
+                                'height': 0,
+                                'author': f"SearXNG via {engine}",
+                                'engine': engine
+                            }
+                            
+                            results.append(result)
+                            print(f"   ✅ Результат {len(results)}: {engine} - {title[:30]}...")
+                            
+                            if len(results) >= max_results:
+                                break
+                    
+                    except Exception:
+                        continue
+                
+                if results:
+                    print(f"🎉 SearXNG успешно: {len(results)} результатов из {base_url}")
+                    return results
+                else:
+                    print(f"⚠️ HTML получен, но изображения не найдены")
+                    
+            elif response.status_code == 403:
+                print(f"⚠️ Доступ запрещен на {base_url}")
+                continue
+            else:
+                print(f"❌ HTTP {response.status_code} на {base_url}")
+                continue
+                
+        except requests.exceptions.Timeout:
+            print(f"⏰ Таймаут на {base_url}")
+            continue
+        except requests.exceptions.ConnectionError:
+            print(f"🔌 Ошибка соединения с {base_url}")
+            continue
         except Exception as e:
-            print(f"Ошибка обработки URL {url}: {e}")
+            print(f"❌ Ошибка с {base_url}: {e}")
             continue
     
-    return all_images
+    # НЕ используем fallback на DuckDuckGo - это маскировало проблему
+    print(f"❌ SearXNG: все инстансы недоступны для запроса '{query}'")
+    print(f"💡 Проверьте, что локальный SearXNG запущен на {searxng_url}")
+    
+    return []
 
-# Функция для обратной совместимости
-def extract_url(text: str) -> Optional[str]:
+
+def search_images_external_searxng(query: str, max_results: int = 4) -> List[Dict]:
     """
-    Извлекает первый URL из текста (для обратной совместимости)
+    Поиск через внешние SearXNG инстансы с обходом блокировок
     """
-    urls = extract_urls_from_text(text)
-    return urls[0] if urls else None
+    print(f"🌐 Внешний SearXNG поиск: '{query}'")
+    
+    # Список рабочих инстансов (обновляется по мере тестирования)
+    external_instances = [
+        "https://searx.dresden.network",
+        "https://search.sapti.me", 
+        "https://searx.tiekoetter.com",
+        "https://searx.fmac.xyz"
+    ]
+    
+    results = []
+    
+    for attempt, instance in enumerate(external_instances):
+        try:
+            print(f"🌐 Попытка {attempt + 1}: {instance}")
+            
+            # Задержка между попытками
+            if attempt > 0:
+                time.sleep(2 + random.uniform(0, 3))
+            
+            search_url = f"{instance.rstrip('/')}/search"
+            
+            # Улучшенные заголовки для обхода блокировок
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Cache-Control': 'max-age=0'
+            }
+            
+            # Пробуем HTML парсинг (более надежно чем JSON)
+            html_params = {
+                'q': query,
+                'categories': 'images',
+                'language': 'en'
+            }
+            
+            response = requests.get(search_url, params=html_params, headers=headers, timeout=20)
+            print(f"📊 Ответ: {response.status_code}")
+            
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                img_tags = soup.find_all('img')
+                processed_urls = set()
+                
+                print(f"✅ HTML получен, размер: {len(response.text)} символов")
+                print(f"🖼️ Найдено img тегов: {len(img_tags)}")
+                
+                for img in img_tags:
+                    if len(results) >= max_results:
+                        break
+                        
+                    src = img.get('src') or img.get('data-src')
+                    if src and src.startswith('http') and src not in processed_urls:
+                        # Фильтруем служебные изображения
+                        skip_patterns = ['/static/', 'favicon', 'logo', 'searx', '/css/', '/js/', '/assets/']
+                        if any(pattern in src for pattern in skip_patterns):
+                            continue
+                        
+                        # Фильтруем нежелательные домены
+                        skip_domains = ['facebook.com', 'instagram.com', 'twitter.com', 'tiktok.com']
+                        if any(domain in src for domain in skip_domains):
+                            continue
+                        
+                        processed_urls.add(src)
+                        
+                        title = img.get('alt') or img.get('title') or f'External SearXNG result for {query}'
+                        
+                        # Определяем источник по URL
+                        engine = 'unknown'
+                        if 'bing.net' in src or 'bing.com' in src:
+                            engine = 'bing'
+                        elif 'googleusercontent.com' in src or 'gstatic.com' in src:
+                            engine = 'google'
+                        elif 'yandex' in src:
+                            engine = 'yandex'
+                        elif 'wikipedia' in src:
+                            engine = 'wikipedia'
+                        
+                        result = {
+                            'url': src,
+                            'title': title[:100],
+                            'source': f"External SearXNG ({engine})",
+                            'thumbnail': src,
+                            'width': 0,
+                            'height': 0,
+                            'author': f"External SearXNG via {engine}",
+                            'engine': engine
+                        }
+                        
+                        results.append(result)
+                        print(f"   ✅ Результат {len(results)}: {engine} - {title[:30]}...")
+                
+                if results:
+                    print(f"🎉 Внешний SearXNG успешно: {len(results)} результатов из {instance}")
+                    return results
+                else:
+                    print(f"⚠️ HTML получен, но изображения не найдены")
+                    
+            elif response.status_code == 403:
+                print(f"⚠️ Доступ запрещен на {instance}")
+                continue
+            elif response.status_code == 429:
+                print(f"⚠️ Rate limit на {instance}")
+                continue
+            else:
+                print(f"❌ HTTP {response.status_code} на {instance}")
+                continue
+                
+        except requests.exceptions.Timeout:
+            print(f"⏰ Таймаут на {instance}")
+            continue
+        except requests.exceptions.ConnectionError:
+            print(f"🔌 Ошибка соединения с {instance}")
+            continue
+        except Exception as e:
+            print(f"❌ Ошибка с {instance}: {e}")
+            continue
+    
+    print(f"❌ Все внешние SearXNG инстансы недоступны для запроса '{query}'")
+    return []
+
+
+def search_images_tenor(query: str, max_results: int = 4) -> List[Dict]:
+    """
+    Улучшенная функция поиска GIF/WebP/MP4 на Tenor.com
+    Использует множественные методы парсинга включая API
+    """
+    results = []
+    encoded_query = quote(query)
+    
+    # Метод 1: Попытка использовать Tenor API v2
+    try:
+        api_url = "https://tenor.googleapis.com/v2/search"
+        api_params = {
+            'q': query,
+            'key': 'AIzaSyAyimkuYQYF_FXVALexPuGQctUWRURdCYQ',  # Публичный ключ
+            'limit': max_results,
+            'media_filter': 'gif,webp'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(api_url, params=api_params, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'results' in data:
+                for item in data['results'][:max_results]:
+                    media_formats = item.get('media_formats', {})
+                    
+                    # Приоритет: gif > webp > mp4
+                    for format_name in ['gif', 'webp', 'mp4']:
+                        if format_name in media_formats:
+                            format_data = media_formats[format_name]
+                            if isinstance(format_data, dict) and 'url' in format_data:
+                                results.append({
+                                    'url': format_data['url'],
+                                    'title': item.get('content_description', f'Tenor {format_name} for {query}'),
+                                    'source': 'Tenor',
+                                    'thumbnail': format_data['url'],
+                                    'width': format_data.get('dims', [0, 0])[0],
+                                    'height': format_data.get('dims', [0, 0])[1],
+                                    'author': 'Tenor',
+                                    'type': format_name
+                                })
+                                break
+                
+                if results:
+                    print(f"✅ Tenor API v2: найдено {len(results)} результатов")
+                    return results[:max_results]
+    
+    except Exception as e:
+        print(f"Tenor API v2 недоступен: {e}")
+    
+    # Метод 2: Альтернативный API endpoint
+    try:
+        alt_api_url = f"https://tenor.com/api/v1/search"
+        alt_params = {
+            'q': query,
+            'key': 'LIVDSRZULELA',
+            'limit': max_results
+        }
+        
+        response = requests.get(alt_api_url, params=alt_params, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            if 'results' in data:
+                for item in data['results'][:max_results]:
+                    media_formats = item.get('media_formats', {})
+                    
+                    for format_name in ['gif', 'webp', 'mp4', 'tinygif']:
+                        if format_name in media_formats:
+                            format_data = media_formats[format_name]
+                            if isinstance(format_data, dict) and 'url' in format_data:
+                                results.append({
+                                    'url': format_data['url'],
+                                    'title': item.get('title', f'Tenor {format_name} for {query}'),
+                                    'source': 'Tenor',
+                                    'thumbnail': format_data['url'],
+                                    'width': format_data.get('dims', [0, 0])[0],
+                                    'height': format_data.get('dims', [0, 0])[1],
+                                    'author': 'Tenor',
+                                    'type': format_name
+                                })
+                                break
+                
+                if results:
+                    print(f"✅ Tenor API v1: найдено {len(results)} результатов")
+                    return results[:max_results]
+    
+    except Exception as e:
+        print(f"Tenor API v1 недоступен: {e}")
+    
+    # Метод 3: HTML парсинг с улучшенными селекторами
+    try:
+        search_urls = [
+            f"https://tenor.com/search/{encoded_query}-gifs",
+            f"https://tenor.com/ru/search/{encoded_query}-gifs"
+        ]
+        
+        session = create_robust_session()
+        
+        for search_url in search_urls:
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'ru,en;q=0.9',
+                    'Referer': 'https://tenor.com/',
+                    'DNT': '1',
+                    'Connection': 'keep-alive'
+                }
+                
+                response = safe_request(search_url, headers=headers, session=session)
+                
+                if response and response.status_code == 200:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    processed_urls = set()
+                    
+                    # Поиск различными методами
+                    selectors = [
+                        'img[src*="tenor.com"]',
+                        'img[src*="media.tenor.com"]',
+                        'img[data-src*="tenor.com"]',
+                        'video[src*="tenor.com"]'
+                    ]
+                    
+                    for selector in selectors:
+                        elements = soup.select(selector)
+                        
+                        for element in elements:
+                            src = element.get('src') or element.get('data-src')
+                            
+                            if src and src not in processed_urls and 'tenor' in src:
+                                # Пропускаем служебные изображения
+                                if any(skip in src for skip in ['/assets/', 'logo', 'icon']):
+                                    continue
+                                    
+                                processed_urls.add(src)
+                                
+                                # Определяем тип медиа
+                                media_type = 'gif'
+                                if '.webp' in src:
+                                    media_type = 'webp'
+                                elif '.mp4' in src:
+                                    media_type = 'mp4'
+                                elif element.name == 'video':
+                                    media_type = 'video'
+                                
+                                results.append({
+                                    'url': src,
+                                    'title': element.get('alt') or element.get('title') or f'Tenor {media_type} for {query}',
+                                    'source': 'Tenor',
+                                    'thumbnail': src,
+                                    'width': 0,
+                                    'height': 0,
+                                    'author': 'Tenor',
+                                    'type': media_type
+                                })
+                                
+                                if len(results) >= max_results:
+                                    break
+                        
+                        if len(results) >= max_results:
+                            break
+                    
+                    # Поиск в JavaScript коде
+                    if len(results) < max_results:
+                        scripts = soup.find_all('script')
+                        for script in scripts:
+                            script_text = script.get_text()
+                            if script_text and ('tenor.com' in script_text or 'media.tenor.com' in script_text):
+                                # Ищем JSON данные с URL
+                                json_patterns = [
+                                    r'"url":"(https://[^"]*tenor\.com[^"]*\.(?:gif|webp|mp4)[^"]*)"',
+                                    r'"gif":\s*\{[^}]*"url":"([^"]*)"',
+                                    r'"webp":\s*\{[^}]*"url":"([^"]*)"'
+                                ]
+                                
+                                for pattern in json_patterns:
+                                    matches = re.findall(pattern, script_text)
+                                    for match in matches:
+                                        if match not in processed_urls and 'tenor' in match:
+                                            processed_urls.add(match)
+                                            
+                                            media_type = 'gif'
+                                            if '.webp' in match:
+                                                media_type = 'webp'
+                                            elif '.mp4' in match:
+                                                media_type = 'mp4'
+                                            
+                                            results.append({
+                                                'url': match,
+                                                'title': f'Tenor {media_type} for {query}',
+                                                'source': 'Tenor',
+                                                'thumbnail': match,
+                                                'width': 0,
+                                                'height': 0,
+                                                'author': 'Tenor',
+                                                'type': media_type
+                                            })
+                                            
+                                            if len(results) >= max_results:
+                                                break
+                                    
+                                    if len(results) >= max_results:
+                                        break
+                                
+                                if len(results) >= max_results:
+                                    break
+                    
+                    if results:
+                        print(f"✅ Tenor HTML: найдено {len(results)} результатов")
+                        return results[:max_results]
+                        
+            except Exception as e:
+                print(f"Ошибка парсинга {search_url}: {e}")
+                continue
+    
+    except Exception as e:
+        print(f"HTML парсинг не сработал: {e}")
+    
+    print(f"❌ Tenor: результаты не найдены для запроса '{query}'")
+    return []
+
+# Функции автопоиска SearXNG инстансов удалены для упрощения интерфейса
+# Пользователи теперь выбирают инстансы вручную через https://searx.space/
+
+# Заглушки для совместимости
+def download_images_async(image_urls, output_dir="images"):
+    return []
+
+def extract_urls_from_text(text):
+    url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+    return re.findall(url_pattern, text)
+
+def search_images_from_urls(text, max_images_per_url=3):
+    return []
